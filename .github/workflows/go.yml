@@ -1,0 +1,98 @@
+name: Go build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run instead of the full suite
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.0"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Create module zip helper
+        run: |
+          mkdir -p "$RUNNER_TEMP/create-mod"
+          cd "$RUNNER_TEMP/create-mod"
+          go mod init example.com/create-mod
+          go get golang.org/x/mod@v0.24.0
+          cat > create_mod.go <<'EOF'
+          package main
+
+          import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+          )
+
+          func main() {
+            if len(os.Args) != 5 {
+              log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+            }
+            m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+            f, err := os.Create(os.Args[4])
+            if err != nil {
+              log.Fatal(err)
+            }
+            defer f.Close()
+            if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+              log.Fatal(err)
+            }
+          }
+          EOF
+
+      - name: Build release module zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/build_output"
+          workflow_path="$GITHUB_WORKSPACE/.github/workflows/go.yml"
+          hidden_workflow="$RUNNER_TEMP/go.yml"
+          mv "$workflow_path" "$hidden_workflow"
+          trap 'mkdir -p "$(dirname "$workflow_path")"; mv "$hidden_workflow" "$workflow_path"' EXIT
+          (cd "$RUNNER_TEMP/create-mod" && go run create_mod.go \
+            golang.org/x/net v0.45.0 "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/build_output/v0.45.0.zip")
+
+      - name: Build packages
+        run: go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            set -o pipefail
+            pattern=$(printf '%s' "$TEST_FILTER" | tr ' ' '|')
+            go test -v -run "^(${pattern})$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for test_name in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${test_name}(/|$)" "$RUNNER_TEMP/scoped.log"
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload release module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: golang.org-x-net-v0.45.0
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
